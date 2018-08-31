@@ -84,8 +84,8 @@ angular.module("com.2fdevs.videogular")
  * - toggleFullScreen(): Toggles between fullscreen and normal mode.
  * - updateTheme(css-url): Removes previous CSS theme and sets a new one.
  * - clearMedia(): Cleans the current media file.
- * - changeSource(array): Updates current media source. Param `array` must be an array of media source objects or a simple URL string.
- * A media source is an object with two properties `src` and `type`. The `src` property must contains a trustful url resource.
+ * - changeSource(array): Updates current media source. Param `array` must be an array of media source objects.
+ * A media source is an object with two properties `src` and `type`. The `src` property must contains a trustful url resource. You may explicitly supply an `isLive` flag to override automatic detection.
  * <pre>{src: $sce.trustAsResourceUrl("http://static.videogular.com/assets/videos/videogular.mp4"), type: "video/mp4"}</pre>
  *
  * Properties
@@ -98,7 +98,8 @@ angular.module("com.2fdevs.videogular")
  * - nativeFullscreen: Boolean value to know if Videogular if fullscreen mode will use native mode or emulated mode.
  * - mediaElement: Reference to video/audio object.
  * - videogularElement: Reference to videogular tag.
- * - sources: Array with current sources or a simple URL string.
+ * - sources: Array with current sources.
+ * - activeSource: The source presently applied to the media element.
  * - tracks: Array with current tracks.
  * - cuePoints: Object containing a list of timelines with cue points. Each property in the object represents a timeline, which is an Array of objects with the next definition:
  * <pre>{
@@ -141,6 +142,7 @@ angular.module("com.2fdevs.videogular")
         var isMetaDataLoaded = false;
         var hasStartTimePlayed = false;
         var isVirtualClip = false;
+        var playPromise = null;
 
         // PUBLIC $API
         this.videogularElement = null;
@@ -183,11 +185,11 @@ angular.module("com.2fdevs.videogular")
             this.isReady = true;
             this.autoPlay = $scope.vgAutoPlay;
             this.playsInline = $scope.vgPlaysInline;
-            this.nativeFullscreen = $scope.vgNativeFullscreen || true;
+            this.nativeFullscreen = normalizeBooleanValue($scope.vgNativeFullscreen, true);
             this.cuePoints = $scope.vgCuePoints;
             this.startTime = $scope.vgStartTime;
             this.virtualClipDuration = $scope.vgVirtualClipDuration;
-            this.clearMediaOnNavigate = $scope.vgClearMediaOnNavigate || true;
+            this.clearMediaOnNavigate = normalizeBooleanValue($scope.vgClearMediaOnNavigate, true);
             this.currentState = VG_STATES.STOP;
 
             isMetaDataLoaded = true;
@@ -237,9 +239,11 @@ angular.module("com.2fdevs.videogular")
         };
 
         this.updateBuffer = function getBuffer(event) {
-            if (event.target.buffered.length) {
-                this.buffered = event.target.buffered;
-                this.bufferEnd = 1000 * event.target.buffered.end(event.target.buffered.length - 1);
+            var buffered = event.target.buffered;
+
+            if (buffered && buffered.length) {
+                this.buffered = buffered;
+                this.bufferEnd = 1000 * buffered.end(buffered.length - 1);
 
                 // Avoid bufferEnd overflow by virtual clips
                 if (this.bufferEnd > this.totalTime) this.bufferEnd = this.totalTime;
@@ -248,6 +252,7 @@ angular.module("com.2fdevs.videogular")
 
         this.onUpdateTime = function (event) {
             var targetTime = 1000 * event.target.currentTime;
+            var isLiveSourceOverride = this.activeSource && angular.isDefined(this.activeSource.isLive);
 
             this.updateBuffer(event);
 
@@ -275,6 +280,11 @@ angular.module("com.2fdevs.videogular")
                 // It's a live streaming without and end
                 this.currentTime = targetTime;
                 this.isLive = true;
+            }
+
+            // allow for the user to override the built in live detection for cases where it doesn't work as desired
+            if (isLiveSourceOverride) {
+                this.isLive = !!this.activeSource.isLive;
             }
 
             var targetSeconds = isVirtualClip ? this.currentTime / 1000 : event.target.currentTime;
@@ -381,6 +391,10 @@ angular.module("com.2fdevs.videogular")
         };
 
         this.seekTime = function (value, byPercent) {
+            if (!Number.isFinite(value)) {
+                throw new TypeError('Expecting a finite number value.');
+            }
+
             var second;
             if (byPercent) {
                 if (isVirtualClip) {
@@ -428,12 +442,39 @@ angular.module("com.2fdevs.videogular")
         };
 
         this.play = function () {
-            this.mediaElement[0].play();
+            var mediaElement = this.mediaElement[0];
+
+            // short-circuit if already playing
+            if (playPromise || !mediaElement.paused) {
+                return;
+            }
+
+            playPromise = mediaElement.play();
+
+            if (playPromise && playPromise.then && playPromise.catch) { // browser has async play promise
+                playPromise
+                    .then(function() {
+                        playPromise = null;
+                    })
+                    .catch(function() {
+                        // deliberately empty for the sake of eating console noise
+                    });
+            }
+
             this.setState(VG_STATES.PLAY);
         };
 
         this.pause = function () {
-            this.mediaElement[0].pause();
+            var mediaElement = this.mediaElement[0];
+            
+            if (playPromise) { // browser has async play promise
+                playPromise.then(function() {
+                    mediaElement.pause();
+                });
+            } else {
+                mediaElement.pause()
+            }
+            
             this.setState(VG_STATES.PAUSE);
         };
 
@@ -505,6 +546,12 @@ angular.module("com.2fdevs.videogular")
         };
 
         this.changeSource = function (newValue) {
+            this.activeSource = newValue;
+
+            if (angular.isDefined(newValue.isLive)) {
+                this.isLive = !!newValue.isLive;
+            }
+
             $scope.vgChangeSource({$source: newValue});
         };
 
@@ -674,18 +721,16 @@ angular.module("com.2fdevs.videogular")
         };
 
         this.onUpdateNativeFullscreen = function onUpdateNativeFullscreen(newValue) {
-            if (newValue == undefined) newValue = true;
-
-            this.nativeFullscreen = newValue;
+            this.nativeFullscreen = normalizeBooleanValue(newValue, true);
         };
 
         this.onUpdateCuePoints = function onUpdateCuePoints(newValue) {
             this.cuePoints = newValue;
-            this.checkCuePoints(this.currentTime);
+            this.checkCuePoints(this.currentTime / 1000);
         };
 
         this.onUpdateClearMediaOnNavigate = function onUpdateClearMediaOnNavigate(newValue) {
-            this.clearMediaOnNavigate = newValue;
+            this.clearMediaOnNavigate = normalizeBooleanValue(newValue, true);
         };
 
         this.addBindings = function () {
@@ -710,6 +755,11 @@ angular.module("com.2fdevs.videogular")
             this.isFullScreen = vgFullscreen.isFullScreen();
             $scope.$parent.$digest();
         };
+
+        function normalizeBooleanValue(value, defaultValue) {
+            // input may be boolean or string, so this will normalize to a boolean
+            return angular.isDefined(value) ? value.toString() === 'true' : !!defaultValue;
+        }
 
         // Empty mediaElement on destroy to avoid that Chrome downloads video even when it's not present
         $scope.$on('$destroy', this.clearMedia.bind(this));
@@ -844,8 +894,10 @@ angular.module("com.2fdevs.videogular")
  * @description
  * Directive to add a source of videos or audios. This directive will create a &lt;video&gt; or &lt;audio&gt; tag and usually will be above plugin tags.
  *
+ * @param {array} vgNativePlayBlacklist An array of functions that accept a media source object and a user agent string. If the function returns true, native playback will be prevented.
  * @param {array} vgSrc Bindable array with a list of media sources or a simple url string. A media source is an object with two properties `src` and `type`. The `src` property must contains a trustful url resource.
  * @param {string} vgType String with "video" or "audio" values to set a <video> or <audio> tag inside <vg-media>.
+ * 
  * <pre>
  * {
  *    src: $sce.trustAsResourceUrl("path/to/video/videogular.mp4"),
@@ -857,7 +909,7 @@ angular.module("com.2fdevs.videogular")
 "use strict";
 angular.module("com.2fdevs.videogular")
     .directive("vgMedia",
-    ["$timeout", "VG_UTILS", "VG_STATES", function ($timeout, VG_UTILS, VG_STATES) {
+    ["$timeout", "$window", "VG_UTILS", "VG_STATES", function ($timeout, $window, VG_UTILS, VG_STATES) {
         return {
             restrict: "E",
             require: "^videogular",
@@ -866,8 +918,9 @@ angular.module("com.2fdevs.videogular")
                 return attrs.vgTemplate || "vg-templates/vg-media-" + vgType;
             },
             scope: {
+                vgNativePlayBlacklist: "=?",
                 vgSrc: "=?",
-                vgType: "=?"
+                vgType: "=?"                
             },
             link: function (scope, elem, attrs, API) {
                 var sources;
@@ -895,47 +948,53 @@ angular.module("com.2fdevs.videogular")
                 };
 
                 scope.changeSource = function changeSource() {
+                    var canPlay = "";
+                    var isSourceApplied = false;
+                    var normalizedSources = angular.isArray(sources) ? sources : [sources];
+                    var firstSource = normalizedSources.length ? normalizedSources[0] : null;
 
-                    if (angular.isArray(sources)) {
-                        var canPlay = "";
+                    // It's a cool browser
+                    if (API.mediaElement[0].canPlayType) {
+                        for (var i = 0, l = sources.length; i < l; i++) {
+                            var currentSource = sources[i];
 
-                        // It's a cool browser
-                        if (API.mediaElement[0].canPlayType) {
-                            for (var i = 0, l = sources.length; i < l; i++) {
-                                canPlay = API.mediaElement[0].canPlayType(sources[i].type);
+                            if (!currentSource || isNativePlayBlacklisted(currentSource)) {
+                                continue;
+                            }
 
-                                if (canPlay == "maybe" || canPlay == "probably") {
-                                    API.mediaElement.attr("src", sources[i].src);
-                                    API.mediaElement.attr("type", sources[i].type);
-                                    //Trigger vgChangeSource($source) API callback in vgController
-                                    API.changeSource(sources[i]);
-                                    break;
-                                }
+                            //check to see if the media element can play the current source
+                            canPlay = API.mediaElement[0].canPlayType(currentSource.type);
+
+                            //if it's usable, apply the current source
+                            if (canPlay == "maybe" || canPlay == "probably") {
+                                isSourceApplied = true;
+
+                                applySourceToMediaElement(currentSource);
+                                break;
                             }
                         }
-                        // It's a crappy browser and it doesn't deserve any respect
-                        else {
-                            // Get H264 or the first one
-                            API.mediaElement.attr("src", sources[0].src);
-                            API.mediaElement.attr("type", sources[0].type);
-                            //Trigger vgChangeSource($source) API callback in vgController
-                            API.changeSource(sources[0]);
-                        }
-                    } else {
-                        API.mediaElement.attr("src", sources);
-                        //Trigger vgChangeSource($source) API callback in vgController
-                        API.changeSource(sources);
                     }
-                    // Android 2.3 support: https://github.com/2fdevs/videogular/issues/187
-                    if (VG_UTILS.isMobileDevice()) API.mediaElement[0].load();
+                    // It's a crappy browser and it doesn't deserve any respect
+                    else if (firstSource && !isNativePlayBlacklisted(firstSource)) {
+                        isSourceApplied = true;
 
-                    $timeout(function () {
-                        if (API.autoPlay && (VG_UTILS.isCordova() || !VG_UTILS.isMobileDevice())) {
-                            API.play();
-                        }
-                    });
+                        // Get H264 or the first one
+                        applySourceToMediaElement(firstSource);
+                    }
 
-                    if (canPlay == "") {
+                    if (isSourceApplied) {
+                        // Android 2.3 support: https://github.com/2fdevs/videogular/issues/187
+                        if (VG_UTILS.isMobileDevice()) API.mediaElement[0].load();
+
+                        //autoplay behavior
+                        $timeout(function () {
+                            if (API.autoPlay && (VG_UTILS.isCordova() || !VG_UTILS.isMobileDevice())) {
+                                API.play();
+                            }
+                        });
+                    } 
+                    //no source applied
+                    else { 
                         API.onVideoError();
                     }
                 };
@@ -960,11 +1019,15 @@ angular.module("com.2fdevs.videogular")
                         return API.playsInline;
                     },
                     function (newValue, oldValue) {
-                        if (newValue) API.mediaElement.attr("webkit-playsinline", "");
-                        else API.mediaElement.removeAttr("webkit-playsinline");
+                        if (newValue) {
+                            API.mediaElement.attr("webkit-playsinline", "");
+                            API.mediaElement.attr("playsinline", "");
+                        } else {
+                            API.mediaElement.removeAttr("webkit-playsinline");
+                            API.mediaElement.removeAttr("playsinline");
+                        }
                     }
                 );
-
 
                 if (API.isConfig) {
                     scope.$watch(
@@ -977,6 +1040,29 @@ angular.module("com.2fdevs.videogular")
                             }
                         }
                     );
+                }
+
+                function applySourceToMediaElement(source) {
+                    API.mediaElement.attr({
+                        src: source.src,
+                        type: source.type
+                    });
+
+                    //Trigger vgChangeSource($source) API callback in vgController
+                    API.changeSource(source);
+                }
+
+                function isNativePlayBlacklisted(source) {
+                    var userAgent = $window.navigator.userAgent;
+
+                    if (!source || !angular.isArray(scope.vgNativePlayBlacklist)) {
+                        return false;
+                    }
+
+                    return scope.vgNativePlayBlacklist.reduce(function(accumulator, currentNativeBlacklistFunc) {
+                        return accumulator || 
+                            (angular.isFunction(currentNativeBlacklistFunc) && currentNativeBlacklistFunc(source, userAgent));
+                    }, false);
                 }
             }
         }
